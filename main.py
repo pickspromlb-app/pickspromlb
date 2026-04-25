@@ -62,7 +62,8 @@ class PicksProOrchestrator:
             # 3. Obtener calendario de hoy
             hoy = date.today()
             games = self.calendar.get_games_for_date(hoy)
-            self.calendar.save_to_db(games)
+            saved_count = self.calendar.save_to_db(games)
+            logger.info(f"💾 Juegos guardados en BD: {saved_count}")
             
             if not games:
                 logger.info("📅 No hay juegos hoy")
@@ -110,6 +111,26 @@ class PicksProOrchestrator:
         logger.info("📊 === GENERANDO LISTÍN COMPLETO ===")
         
         try:
+            # FIX: Validar que haya juegos en BD antes de continuar
+            juegos_hoy = db.select("juegos", filters={"fecha": date.today().isoformat()})
+            if not juegos_hoy:
+                logger.warning("⚠️ No hay juegos en BD para hoy. Ejecutando calendar_collector primero...")
+                games = self.calendar.get_games_for_date(date.today())
+                self.calendar.save_to_db(games)
+                juegos_hoy = db.select("juegos", filters={"fecha": date.today().isoformat()})
+                
+                if not juegos_hoy:
+                    logger.error("❌ Sin juegos disponibles. Abortando task_generar_listin.")
+                    db.insert("log_ejecuciones", {
+                        "fecha": date.today().isoformat(),
+                        "tipo": "task_generar_listin",
+                        "estado": "error",
+                        "mensaje": "Sin juegos disponibles para hoy"
+                    })
+                    return
+            
+            logger.info(f"📋 Procesando {len(juegos_hoy)} juegos")
+            
             # 1. Recolectar stats
             logger.info("1/7 Recolectando stats de equipos...")
             self.stats.collect_for_all_teams()
@@ -120,7 +141,6 @@ class PicksProOrchestrator:
             
             # 3. Recolectar clima
             logger.info("3/7 Recolectando clima...")
-            juegos_hoy = db.select("juegos", filters={"fecha": date.today().isoformat()})
             self.weather.update_games_with_weather(juegos_hoy)
             
             # 4. Aplicar filtros
@@ -130,11 +150,35 @@ class PicksProOrchestrator:
             # 5. Generar JSON del listín
             logger.info("5/7 Generando JSON del listín...")
             listin = self.builder.build()
+            
+            # FIX: Validar que el listín no esté vacío antes de continuar
+            if not listin or not listin.get("juegos"):
+                logger.warning("⚠️ Listín vacío. No hay datos suficientes para análisis.")
+                db.insert("log_ejecuciones", {
+                    "fecha": date.today().isoformat(),
+                    "tipo": "task_generar_listin",
+                    "estado": "error",
+                    "mensaje": "Listín vacío - sin stats de equipos"
+                })
+                return
+            
             self.builder.save(listin)
             
             # 6. Analizar con Gemini
             logger.info("6/7 Analizando con Gemini...")
             analisis = self.agent.analizar_listin(listin)
+            
+            # FIX: Validar que Gemini haya respondido antes de continuar
+            if not analisis:
+                logger.error("❌ Gemini no devolvió análisis. Abortando envío de picks.")
+                db.insert("log_ejecuciones", {
+                    "fecha": date.today().isoformat(),
+                    "tipo": "task_generar_listin",
+                    "estado": "error",
+                    "mensaje": "Gemini retornó vacío"
+                })
+                return
+            
             self.agent.guardar_picks(analisis)
             
             # 7. Enviar picks por Telegram
@@ -322,6 +366,11 @@ class PicksProOrchestrator:
             logger.warning("⚠️ TELEGRAM_CHAT_ID no configurado")
             return
         
+        # FIX: Validar que analisis no sea None
+        if not analisis:
+            logger.warning("⚠️ Sin análisis para enviar a Telegram")
+            return
+        
         try:
             picks_hoy = db.select("picks_diarios", filters={"fecha": date.today().isoformat()})
             await self.bot.enviar_picks_automatico(picks_hoy, mensaje_extra=prefijo)
@@ -491,12 +540,15 @@ async def main():
     # Iniciar bot de Telegram en paralelo
     logger.info("🤖 Iniciando bot de Telegram...")
     
+    # FIX: Esperar 5 segundos antes de arrancar el bot para evitar conflict con instancia anterior
+    await asyncio.sleep(5)
+    
     # Mantener el sistema corriendo
     try:
         # Bot polling
         await orchestrator.bot.app.initialize()
         await orchestrator.bot.app.start()
-        await orchestrator.bot.app.updater.start_polling()
+        await orchestrator.bot.app.updater.start_polling(drop_pending_updates=True)
         
         logger.info("✅ Sistema corriendo. Presiona Ctrl+C para detener.")
         
