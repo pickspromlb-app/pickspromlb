@@ -1,0 +1,57 @@
+# Variables de entorno
+.env
+.env.local
+.env.production
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# Distribución
+build/
+dist/
+*.egg-info/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Datos locales
+data/
+*.db
+*.sqlite
+*.csv
+*.xlsx
+*.pdf
+
+# Temporales
+tmp/
+temp/
+*.tmp
+
+# Cache
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# Frontend
+node_modules/
+.next/
+out/
+.vercel

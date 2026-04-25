@@ -1,0 +1,41 @@
+# Web framework y API
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12
+
+# Base de datos
+supabase==2.9.1
+psycopg2-binary==2.9.10
+
+# Datos MLB
+pybaseball==2.2.7
+MLB-StatsAPI==1.7.2
+
+# APIs externas
+requests==2.32.3
+httpx==0.27.2
+
+# Procesamiento de datos
+pandas==2.2.3
+numpy==2.1.2
+python-dateutil==2.9.0
+
+# Variables de entorno
+python-dotenv==1.0.1
+
+# Bot de Telegram
+python-telegram-bot==21.6
+
+# Agente Gemini
+google-generativeai==0.8.3
+
+# Cron y scheduling
+apscheduler==3.10.4
+pytz==2024.2
+
+# Logging y utilidades
+loguru==0.7.2
+
+# Exportación
+openpyxl==3.1.5
+reportlab==4.2.5
