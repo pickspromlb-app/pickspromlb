@@ -1,11 +1,23 @@
 """
-PicksProMLB - Orquestador Principal
-Coordina todos los módulos y ejecuta el scheduler dinámico
+PicksProMLB - Orquestador v2.1 (con correcciones críticas)
+================================================================
+ARQUITECTURA INTELIGENTE con caché:
+- Carga inicial: UNA sola vez (~30 min) vía /cargar_historico
+- Cada mañana 7 AM ET: solo actualiza juegos del día anterior (~5 min)
+- /analizar: lee de caché + filtros + listín (<1 min)
+
+CORRECCIONES INCLUIDAS (v2.1):
+1. ✅ get_today_et() en lugar de date.today() (bug de zona horaria a las 11pm)
+2. ✅ Validar primer_juego/ultimo_juego antes de programar triggers
+3. ✅ get_games_for_date(fecha) consistente (siempre con parámetro)
+4. ✅ Evaluador de picks soporta ML, RL +1.5/+2.5, F5, Over/Under, Team Total
+5. ✅ Resultados de picks van a picks_diarios; filtros_aplicados solo mide filtros
+6. ✅ Protección contra listín duplicado (no regenerar si ya existe)
 """
 
 import asyncio
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Optional, List, Dict
 import pytz
 from loguru import logger
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -14,549 +26,605 @@ from apscheduler.triggers.date import DateTrigger
 
 from app.utils.config import config
 from app.utils.database import db
+from app.utils.time_utils import get_today_et, get_yesterday_et, get_now_et
+from app.utils.pick_evaluator import evaluate_pick_result, parse_tipo_pick
+
 from app.collectors.calendar_collector import CalendarCollector
+from app.collectors.historico_collector import HistoricoCollector
 from app.collectors.team_stats_collector import TeamStatsCollector
 from app.collectors.odds_collector import OddsCollector
 from app.collectors.weather_collector import WeatherCollector
 from app.engine.filter_engine import FilterEngine
+from app.engine.historico_metricas import HistoricoMetricas
+from app.exports.listin_builder import ListinBuilder
 from app.exports.json_builder import ListinJSONBuilder
 from app.agent.gemini_agent import GeminiAgent
 from app.bot.telegram_bot import PicksProBot
 
 
 class PicksProOrchestrator:
-    """Orquestador principal del sistema"""
-    
+    """Orquestador principal v2.1"""
+
     def __init__(self):
         self.tz = pytz.timezone(config.TIMEZONE)
         self.scheduler = AsyncIOScheduler(timezone=self.tz)
-        
+
         self.calendar = CalendarCollector()
+        self.historico_col = HistoricoCollector()
         self.stats = TeamStatsCollector()
         self.odds = OddsCollector()
         self.weather = WeatherCollector()
         self.engine = FilterEngine()
-        self.builder = ListinJSONBuilder()
+        self.historico_metricas = HistoricoMetricas()
+        self.builder_listin = ListinBuilder()
+        self.builder_json = ListinJSONBuilder()
         self.agent = GeminiAgent()
         self.bot = PicksProBot()
-    
-    # ========== TAREAS PROGRAMADAS ==========
-    
+        self.bot.orchestrator = self
+
+    # ========================= TAREA MATUTINA (7 AM ET) =========================
+
     async def task_morning(self):
         """
-        Tarea matutina (7 AM ET):
-        1. Procesa resultados del día anterior
-        2. Actualiza histórico de filtros
-        3. Detecta horarios de hoy y programa los demás triggers
+        Tarea matutina diaria (7 AM ET):
+        1. Procesa resultados del día anterior + evalúa picks
+        2. Actualiza histórico de juegos (solo ayer, ~5 min)
+        3. Actualiza histórico de filtros + métricas
+        4. Programa triggers del día
         """
         logger.info("🌅 === TAREA MATUTINA INICIADA ===")
-        
         try:
-            # 1. Procesar resultados de ayer
-            ayer = date.today() - timedelta(days=1)
+            # FIX #1: Usar zona ET en lugar de date.today()
+            ayer = get_yesterday_et()
+            hoy = get_today_et()
+
+            # 1. Procesar resultados de ayer (jala scores + actualiza juegos)
             await self._procesar_resultados(ayer)
-            
-            # 2. Actualizar histórico de filtros
+
+            # FIX #5: Evaluar picks de ayer y guardar resultados en picks_diarios
+            await self._evaluar_picks_dia(ayer)
+
+            # 2. Actualizar caché histórico (solo ayer)
+            try:
+                resumen = self.historico_col.actualizar_ayer()
+                logger.info(f"📦 Caché actualizada: {resumen}")
+            except Exception as e:
+                logger.warning(f"No se pudo actualizar histórico: {e}")
+
+            # 3. Actualizar histórico de filtros + métricas
             await self._actualizar_historico_filtros()
-            
-            # 3. Obtener calendario de hoy
-            hoy = date.today()
+            try:
+                self.historico_metricas.actualizar_historico()
+            except Exception as e:
+                logger.warning(f"No se pudo actualizar métricas: {e}")
+
+            # 4. Calendario de hoy (FIX #3: pasar fecha explícita)
             games = self.calendar.get_games_for_date(hoy)
-            saved_count = self.calendar.save_to_db(games)
-            logger.info(f"💾 Juegos guardados en BD: {saved_count}")
-            
+            saved = self.calendar.save_to_db(games)
+            logger.info(f"💾 Juegos del día guardados: {saved}")
+
             if not games:
                 logger.info("📅 No hay juegos hoy")
+                self._registrar_log(hoy, "task_morning", "exito", "Sin juegos hoy")
                 return
-            
-            # 4. Detectar primer y último juego
+
+            # 5. Programar triggers (FIX #2: validar None)
             primer_juego, ultimo_juego = self.calendar.get_first_and_last_game_times(hoy)
-            
-            if not primer_juego:
-                logger.warning("⚠️ No se pudo determinar hora del primer juego")
-                return
-            
-            # 5. Programar los demás triggers basados en horarios reales
             self._programar_triggers_dinamicos(primer_juego, ultimo_juego)
-            
-            logger.info(f"✅ Tarea matutina completada. Primer juego: {primer_juego}, último: {ultimo_juego}")
-            
-            # Log
-            db.insert("log_ejecuciones", {
-                "fecha": hoy.isoformat(),
-                "tipo": "task_morning",
-                "estado": "exito",
-                "mensaje": f"{len(games)} juegos programados"
-            })
+
+            self._registrar_log(
+                hoy, "task_morning", "exito",
+                f"{len(games)} juegos | Caché actualizada",
+            )
         except Exception as e:
-            logger.error(f"❌ Error en tarea matutina: {e}")
-            db.insert("log_ejecuciones", {
-                "fecha": date.today().isoformat(),
-                "tipo": "task_morning",
-                "estado": "error",
-                "mensaje": str(e)
-            })
-    
+            logger.error(f"❌ Error tarea matutina: {e}")
+            self._registrar_log(get_today_et(), "task_morning", "error", str(e))
+
+    # ========================= GENERAR LISTÍN =========================
+
     async def task_generar_listin(self):
+        """Llamado automáticamente 4h antes del primer juego"""
+        await self._generar_listin_completo(automatico=True)
+
+    async def task_generar_listin_manual(self):
+        """Llamado desde /analizar en Telegram (forzar regeneración)"""
+        await self._generar_listin_completo(automatico=False, forzar=True)
+
+    async def _generar_listin_completo(self, automatico: bool = True, forzar: bool = False):
         """
-        Generar listín completo (4 horas antes del primer juego):
-        1. Recolecta stats actualizadas de todos los equipos
-        2. Recolecta odds
-        3. Recolecta clima
-        4. Aplica filtros
-        5. Genera JSON
-        6. Analiza con Gemini
-        7. Envía picks por Telegram
+        Pipeline RÁPIDO (lee de caché):
+        1. Validar juegos del día
+        2. FIX #6: Verificar si ya hay listín generado (no duplicar)
+        3. Calcular stats por ventana (LEE de caché, instantáneo)
+        4. Recolectar odds + clima
+        5. Aplicar filtros
+        6. Generar listín
+        7. Llamar Gemini (opcional)
         """
-        logger.info("📊 === GENERANDO LISTÍN COMPLETO ===")
-        
+        modo = "AUTOMÁTICO" if automatico else "MANUAL (/analizar)"
+        logger.info(f"📊 === GENERANDO LISTÍN ({modo}) ===")
+        # FIX #1: usar zona ET
+        hoy = get_today_et()
+        fecha_str = hoy.isoformat()
+
         try:
-            # FIX: Validar que haya juegos en BD antes de continuar
-            juegos_hoy = db.select("juegos", filters={"fecha": date.today().isoformat()})
+            # 1. Validar juegos en BD
+            juegos_hoy = db.select("juegos", filters={"fecha": fecha_str})
             if not juegos_hoy:
-                logger.warning("⚠️ No hay juegos en BD para hoy. Ejecutando calendar_collector primero...")
-                games = self.calendar.get_games_for_date(date.today())
+                logger.warning("⚠️ Sin juegos en BD. Recolectando...")
+                # FIX #3: pasar fecha explícita
+                games = self.calendar.get_games_for_date(hoy)
                 self.calendar.save_to_db(games)
-                juegos_hoy = db.select("juegos", filters={"fecha": date.today().isoformat()})
-                
+                juegos_hoy = db.select("juegos", filters={"fecha": fecha_str})
                 if not juegos_hoy:
-                    logger.error("❌ Sin juegos disponibles. Abortando task_generar_listin.")
-                    db.insert("log_ejecuciones", {
-                        "fecha": date.today().isoformat(),
-                        "tipo": "task_generar_listin",
-                        "estado": "error",
-                        "mensaje": "Sin juegos disponibles para hoy"
-                    })
+                    logger.error("❌ Sin juegos. Abortando.")
+                    self._registrar_log(hoy, "task_generar_listin", "error", "Sin juegos")
                     return
-            
+
+            # FIX #6: protección contra listín duplicado
+            if not forzar:
+                existing = db.select("listines_diarios", filters={"fecha": fecha_str})
+                if existing:
+                    logger.info(
+                        f"⚠️ Listín del {fecha_str} ya existe. "
+                        f"Omitiendo generación (usar forzar=True para regenerar)."
+                    )
+                    self._registrar_log(
+                        hoy, "task_generar_listin", "omitido",
+                        "Listín ya existe, no se regeneró",
+                    )
+                    return
+
             logger.info(f"📋 Procesando {len(juegos_hoy)} juegos")
-            
-            # 1. Recolectar stats
-            logger.info("1/7 Recolectando stats de equipos...")
-            self.stats.collect_for_all_teams()
-            
-            # 2. Recolectar odds
-            logger.info("2/7 Recolectando odds...")
-            self.odds.update_db(self.odds.parse_odds(self.odds.fetch_odds()))
-            
-            # 3. Recolectar clima
-            logger.info("3/7 Recolectando clima...")
-            self.weather.update_games_with_weather(juegos_hoy)
-            
-            # 4. Aplicar filtros
-            logger.info("4/7 Aplicando filtros...")
-            self.engine.analizar_dia()
-            
-            # 5. Generar JSON del listín
-            logger.info("5/7 Generando JSON del listín...")
-            listin = self.builder.build()
-            
-            # FIX: Validar que el listín no esté vacío antes de continuar
-            if not listin or not listin.get("juegos"):
-                logger.warning("⚠️ Listín vacío. No hay datos suficientes para análisis.")
-                db.insert("log_ejecuciones", {
-                    "fecha": date.today().isoformat(),
-                    "tipo": "task_generar_listin",
-                    "estado": "error",
-                    "mensaje": "Listín vacío - sin stats de equipos"
-                })
+
+            # 2. Calcular stats por ventana DESDE CACHÉ (rápido)
+            logger.info("1/6 ⚾ Calculando stats sabermétricas desde caché...")
+            stats_results = self.stats.collect_for_all_teams(hoy)
+            if not stats_results:
+                logger.error("❌ Sin stats. La caché podría estar vacía.")
+                self._registrar_log(
+                    hoy, "task_generar_listin", "error",
+                    "Caché vacía. Ejecutar /cargar_historico",
+                )
                 return
-            
-            self.builder.save(listin)
-            
-            # 6. Analizar con Gemini
-            logger.info("6/7 Analizando con Gemini...")
-            analisis = self.agent.analizar_listin(listin)
-            
-            # FIX: Validar que Gemini haya respondido antes de continuar
-            if not analisis:
-                logger.error("❌ Gemini no devolvió análisis. Abortando envío de picks.")
-                db.insert("log_ejecuciones", {
-                    "fecha": date.today().isoformat(),
-                    "tipo": "task_generar_listin",
-                    "estado": "error",
-                    "mensaje": "Gemini retornó vacío"
-                })
+
+            # 3. Odds
+            logger.info("2/6 💰 Recolectando odds...")
+            try:
+                self.odds.update_db(self.odds.parse_odds(self.odds.fetch_odds()))
+            except Exception as e:
+                logger.warning(f"Error odds: {e}")
+
+            # 4. Clima
+            logger.info("3/6 🌤️ Recolectando clima...")
+            try:
+                juegos_hoy = db.select("juegos", filters={"fecha": fecha_str})
+                self.weather.update_games_with_weather(juegos_hoy)
+            except Exception as e:
+                logger.warning(f"Error clima: {e}")
+
+            # 5. Aplicar filtros
+            logger.info("4/6 🎯 Aplicando los 10 filtros...")
+            self.engine.analizar_dia(hoy)
+
+            # 6. Generar listín
+            logger.info("5/6 📋 Generando listín visual...")
+            listin = self.builder_listin.build(hoy)
+            if not listin:
+                logger.warning("Listín vacío")
                 return
-            
-            self.agent.guardar_picks(analisis)
-            
-            # 7. Enviar picks por Telegram
-            logger.info("7/7 Enviando picks por Telegram...")
-            await self._enviar_picks_a_telegram(analisis)
-            
-            logger.info("✅ Listín generado y enviado")
-            
-            db.insert("log_ejecuciones", {
-                "fecha": date.today().isoformat(),
-                "tipo": "task_generar_listin",
-                "estado": "exito",
-                "mensaje": f"{len(listin.get('juegos', []))} juegos analizados"
-            })
+
+            self.builder_listin.save_json(listin, hoy)
+            self.builder_listin.save_html(listin, hoy)
+            self.builder_listin.save_to_supabase(listin, hoy)
+
+            # 7. Análisis con Gemini (opcional)
+            logger.info("6/6 🧠 Análisis con Gemini...")
+            try:
+                listin_json = self.builder_json.build(hoy)
+                analisis = self.agent.analizar_listin(listin_json)
+                if analisis:
+                    self.agent.guardar_picks(analisis, hoy)
+            except Exception as e:
+                logger.warning(f"Gemini falló (no crítico): {e}")
+
+            logger.info("✅ Listín generado completamente")
+            self._registrar_log(
+                hoy, "task_generar_listin", "exito",
+                f"{len(juegos_hoy)} juegos analizados",
+            )
+
+            # Notificación corta solo en modo automático
+            if automatico and config.TELEGRAM_CHAT_ID:
+                try:
+                    picks = listin.get("picks", {})
+                    directa = picks.get("directa_del_dia")
+                    msg = (
+                        f"✅ *Análisis del día listo*\n"
+                        f"_{len(juegos_hoy)} juegos procesados_\n\n"
+                    )
+                    if directa:
+                        msg += f"🎯 *Directa:* {directa['favorito']} ({directa['filtros_pasados']}/10)\n\n"
+                    msg += "Usa /listin para ver completo o /picks para ver picks."
+                    await self.bot.app.bot.send_message(
+                        chat_id=config.TELEGRAM_CHAT_ID,
+                        text=msg,
+                        parse_mode="Markdown",
+                    )
+                except Exception as e:
+                    logger.warning(f"No se pudo notificar: {e}")
+
         except Exception as e:
             logger.error(f"❌ Error generando listín: {e}")
-            db.insert("log_ejecuciones", {
-                "fecha": date.today().isoformat(),
-                "tipo": "task_generar_listin",
-                "estado": "error",
-                "mensaje": str(e)
-            })
-    
+            self._registrar_log(hoy, "task_generar_listin", "error", str(e))
+
+    # ========================= ACTUALIZAR / RESULTADOS =========================
+
     async def task_actualizar_picks(self):
-        """
-        Actualizar picks (1 hora antes del primer juego):
-        - Verifica si las odds cambiaron significativamente
-        - Confirma pitchers (a veces los cambian de último minuto)
-        - Re-evalúa picks si algo cambió
-        """
+        """1h antes del primer juego: re-evaluar con odds actualizados"""
         logger.info("🔄 === ACTUALIZANDO PICKS ===")
-        
         try:
-            # Actualizar odds
             self.odds.update_db(self.odds.parse_odds(self.odds.fetch_odds()))
-            
-            # Actualizar calendario (puede haber cambios de pitchers)
-            games = self.calendar.get_games_for_date()
+            # FIX #3: pasar fecha explícita
+            hoy = get_today_et()
+            games = self.calendar.get_games_for_date(hoy)
             self.calendar.save_to_db(games)
-            
-            # Re-aplicar filtros
-            self.engine.analizar_dia()
-            
-            # Re-generar listín y picks (opcional, puede consumir cuota Gemini)
-            # listin = self.builder.build()
-            # analisis = self.agent.analizar_listin(listin)
-            # await self._enviar_picks_a_telegram(analisis, prefijo="🔄 *ACTUALIZACIÓN:* ")
-            
+            self.engine.analizar_dia(hoy)
             logger.info("✅ Picks actualizados")
         except Exception as e:
-            logger.error(f"❌ Error actualizando picks: {e}")
-    
+            logger.error(f"❌ Error: {e}")
+
     async def task_resultados(self):
-        """
-        Procesar resultados (2 horas después del último juego):
-        - Jala resultados finales
-        - Marca picks como ganados/perdidos
-        - Envía resumen por Telegram
-        """
+        """2h después del último juego: procesar resultados + evaluar picks"""
         logger.info("📊 === PROCESANDO RESULTADOS DEL DÍA ===")
-        
         try:
-            hoy = date.today()
+            hoy = get_today_et()
             await self._procesar_resultados(hoy)
-            
-            # Enviar resumen por Telegram
-            await self._enviar_resumen_dia(hoy)
-            
+            # FIX #5: evaluar picks del día y guardar resultados
+            await self._evaluar_picks_dia(hoy)
             logger.info("✅ Resultados procesados")
         except Exception as e:
-            logger.error(f"❌ Error procesando resultados: {e}")
-    
-    # ========== MÉTODOS AUXILIARES ==========
-    
+            logger.error(f"❌ Error: {e}")
+
     async def _procesar_resultados(self, target_date: date):
-        """Jala resultados finales y marca picks"""
+        """Jala resultados finales y actualiza tabla 'juegos'"""
         logger.info(f"📊 Procesando resultados de {target_date}")
-        
-        # Obtener juegos finalizados
+        # FIX #3: siempre pasar fecha explícita
         games = self.calendar.get_games_for_date(target_date)
         finalizados = [g for g in games if g.get("estado") == "finalizado"]
-        
+
         for game in finalizados:
             try:
-                # Actualizar resultado en juegos
+                local = game["equipo_local"]
+                visit = game["equipo_visitante"]
+                rl = game.get("resultado_local") or 0
+                rv = game.get("resultado_visitante") or 0
+                ganador = local if rl > rv else visit
+
                 db.update(
                     "juegos",
                     {
-                        "resultado_local": game.get("resultado_local"),
-                        "resultado_visitante": game.get("resultado_visitante"),
-                        "total_carreras": (game.get("resultado_local", 0) or 0) + (game.get("resultado_visitante", 0) or 0),
-                        "ganador": game["equipo_local"] if game.get("resultado_local", 0) > game.get("resultado_visitante", 0) else game["equipo_visitante"],
+                        "resultado_local": rl,
+                        "resultado_visitante": rv,
+                        "total_carreras": rl + rv,
+                        "ganador": ganador,
                         "estado": "finalizado",
                     },
                     {
                         "fecha": target_date.isoformat(),
-                        "equipo_local": game["equipo_local"],
-                        "equipo_visitante": game["equipo_visitante"],
-                    }
+                        "equipo_local": local,
+                        "equipo_visitante": visit,
+                    },
                 )
-                
-                # Marcar picks como ganados/perdidos
-                await self._marcar_resultado_pick(game, target_date)
-                
             except Exception as e:
-                logger.error(f"❌ Error procesando {game.get('equipo_local')} vs {game.get('equipo_visitante')}: {e}")
-    
-    async def _marcar_resultado_pick(self, game: dict, target_date: date):
-        """Marca el resultado de un pick basado en el resultado real del juego"""
-        local = game["equipo_local"]
-        visit = game["equipo_visitante"]
-        score_local = game.get("resultado_local", 0)
-        score_visit = game.get("resultado_visitante", 0)
-        
-        # Buscar análisis del juego
-        analisis = db.select(
-            "filtros_aplicados",
-            filters={"fecha": target_date.isoformat(), "equipo_favorecido": local}
-        )
-        if not analisis:
-            analisis = db.select(
-                "filtros_aplicados",
-                filters={"fecha": target_date.isoformat(), "equipo_favorecido": visit}
-            )
-        
-        if not analisis:
+                logger.error(f"❌ Error procesando juego: {e}")
+
+    # ========================= FIX #5: EVALUACIÓN INTELIGENTE DE PICKS =========================
+
+    async def _evaluar_picks_dia(self, target_date: date):
+        """
+        FIX #5: Evalúa los picks de un día usando el evaluador inteligente.
+        Soporta ML, RL +1.5/+2.5/+3.5, F5, Over/Under, Team Total.
+        Los resultados se guardan EN picks_diarios (no en filtros_aplicados).
+        """
+        logger.info(f"🎯 Evaluando picks de {target_date}")
+        fecha_str = target_date.isoformat()
+
+        # Obtener picks del día
+        try:
+            picks = db.select("picks_diarios", filters={"fecha": fecha_str})
+        except Exception as e:
+            logger.error(f"No se pudieron obtener picks: {e}")
             return
-        
-        a = analisis[0]
-        favorito = a["equipo_favorecido"]
-        
-        # Determinar si ganó (lógica simple: el favorito ganó el juego)
-        if favorito == local:
-            gano = score_local > score_visit
-        else:
-            gano = score_visit > score_local
-        
-        db.update(
-            "filtros_aplicados",
-            {"resultado_pick": gano},
-            {
-                "fecha": target_date.isoformat(),
-                "equipo_favorecido": favorito,
-                "equipo_rival": local if favorito == visit else visit,
-            }
+
+        if not picks:
+            logger.info(f"Sin picks para evaluar en {target_date}")
+            return
+
+        # Obtener juegos finalizados del día
+        try:
+            juegos = db.select("juegos", filters={"fecha": fecha_str})
+        except Exception as e:
+            logger.error(f"No se pudieron obtener juegos: {e}")
+            return
+
+        # Mapeo rápido por matchup
+        juegos_por_equipo = {}
+        for j in juegos:
+            local = j.get("equipo_local")
+            visit = j.get("equipo_visitante")
+            if local:
+                juegos_por_equipo.setdefault(local, []).append(j)
+            if visit:
+                juegos_por_equipo.setdefault(visit, []).append(j)
+
+        evaluados = 0
+        ganados = 0
+        perdidos = 0
+        sin_evaluar = 0
+
+        for pick in picks:
+            try:
+                # Si ya tiene resultado, saltarlo
+                if pick.get("resultado") in ("ganado", "perdido"):
+                    continue
+
+                # Identificar equipo del pick
+                juegos_data = pick.get("juegos") or []
+                if not isinstance(juegos_data, list) or not juegos_data:
+                    sin_evaluar += 1
+                    continue
+
+                # Para cada sub-pick (caso de combinada)
+                resultados_sub = []
+                for sub in juegos_data:
+                    if not isinstance(sub, dict):
+                        continue
+                    equipo = sub.get("equipo") or sub.get("favorito")
+                    if not equipo:
+                        continue
+
+                    juegos_eq = juegos_por_equipo.get(equipo, [])
+                    if not juegos_eq:
+                        resultados_sub.append(None)
+                        continue
+
+                    # Construir el pick formato evaluador
+                    pick_eval = {
+                        "tipo_pick": sub.get("tipo_pick") or pick.get("tipo_pick", "ML"),
+                        "equipo": equipo,
+                    }
+                    juego_eq = juegos_eq[0]
+                    res = evaluate_pick_result(pick_eval, juego_eq)
+                    resultados_sub.append(res)
+
+                # Determinar resultado final del pick (combinado o sencillo)
+                if not resultados_sub:
+                    sin_evaluar += 1
+                    continue
+
+                if any(r is None for r in resultados_sub):
+                    # Algún sub-pick sin evaluar (juego no finalizado o push)
+                    sin_evaluar += 1
+                    continue
+
+                resultado_final = "ganado" if all(r is True for r in resultados_sub) else "perdido"
+
+                # FIX #5: actualizar picks_diarios con resultado
+                pick_id = pick.get("id")
+                if pick_id:
+                    db.update(
+                        "picks_diarios",
+                        {
+                            "resultado": resultado_final,
+                            "fecha_evaluacion": get_now_et().isoformat(),
+                        },
+                        {"id": pick_id},
+                    )
+                    evaluados += 1
+                    if resultado_final == "ganado":
+                        ganados += 1
+                    else:
+                        perdidos += 1
+            except Exception as e:
+                logger.warning(f"Error evaluando pick {pick.get('id')}: {e}")
+                continue
+
+        logger.info(
+            f"✅ Picks evaluados: {evaluados} (ganados: {ganados}, perdidos: {perdidos}, "
+            f"sin evaluar: {sin_evaluar})"
         )
-    
+
     async def _actualizar_historico_filtros(self):
-        """Actualiza la efectividad de cada filtro basado en histórico real"""
-        logger.info("📊 Actualizando histórico de filtros...")
-        
-        client = db.get_client()
-        
+        """
+        Actualiza efectividad histórica de cada filtro.
+        FIX #5: filtros_aplicados ya NO tiene resultado_pick (eso vive en picks_diarios).
+        Aquí calculamos: para cada filtro, en qué % de juegos donde el filtro ESTABA ACTIVO,
+        el equipo favorecido terminó GANANDO el juego.
+        """
+        logger.info("📊 Actualizando histórico filtros...")
+
         for filtro_id in [f"f{i}" for i in range(1, 11)]:
             try:
-                # Total de casos donde este filtro pasó
-                response = client.table("filtros_aplicados") \
-                    .select("*") \
-                    .eq(filtro_id, True) \
-                    .not_.is_("resultado_pick", "null") \
+                # Obtener filtros aplicados
+                client = db.get_client()
+                response = (
+                    client.table("filtros_aplicados")
+                    .select("*")
+                    .eq(filtro_id, True)
                     .execute()
-                
-                data = response.data
-                total = len(data)
-                ganados = sum(1 for d in data if d.get("resultado_pick") is True)
-                
+                )
+                filtros_data = response.data or []
+
+                if not filtros_data:
+                    continue
+
+                # Para cada filtro aplicado, ver si el equipo favorecido ganó el juego
+                total = 0
+                ganados = 0
+
+                for f in filtros_data:
+                    fecha = f.get("fecha")
+                    favorito = f.get("equipo_favorecido")
+                    rival = f.get("equipo_rival")
+
+                    if not (fecha and favorito and rival):
+                        continue
+
+                    # Buscar el juego correspondiente
+                    juegos = db.select("juegos", filters={"fecha": fecha})
+                    juego = next(
+                        (
+                            j
+                            for j in juegos
+                            if (j.get("equipo_local") == favorito and j.get("equipo_visitante") == rival)
+                            or (j.get("equipo_local") == rival and j.get("equipo_visitante") == favorito)
+                        ),
+                        None,
+                    )
+
+                    if not juego or juego.get("estado") != "finalizado":
+                        continue
+
+                    if juego.get("resultado_local") is None or juego.get("resultado_visitante") is None:
+                        continue
+
+                    total += 1
+                    rl = juego.get("resultado_local") or 0
+                    rv = juego.get("resultado_visitante") or 0
+                    ganador = juego.get("equipo_local") if rl > rv else juego.get("equipo_visitante")
+                    if ganador == favorito:
+                        ganados += 1
+
                 if total > 0:
-                    efectividad = round((ganados / total) * 100, 2)
+                    ef = round((ganados / total) * 100, 2)
                     db.update(
                         "efectividad_filtros",
                         {
                             "total_casos": total,
                             "total_ganados": ganados,
-                            "porcentaje_efectividad": efectividad,
-                            "fecha_ultima_actualizacion": date.today().isoformat(),
+                            "porcentaje_efectividad": ef,
+                            "fecha_ultima_actualizacion": get_today_et().isoformat(),
                         },
-                        {"filtro": filtro_id.upper()}
+                        {"filtro": filtro_id.upper()},
                     )
             except Exception as e:
-                logger.warning(f"⚠️ Error actualizando {filtro_id}: {e}")
-    
-    async def _enviar_picks_a_telegram(self, analisis: dict, prefijo: str = ""):
-        """Envía los picks generados al chat de Telegram"""
-        if not config.TELEGRAM_CHAT_ID:
-            logger.warning("⚠️ TELEGRAM_CHAT_ID no configurado")
-            return
-        
-        # FIX: Validar que analisis no sea None
-        if not analisis:
-            logger.warning("⚠️ Sin análisis para enviar a Telegram")
-            return
-        
-        try:
-            picks_hoy = db.select("picks_diarios", filters={"fecha": date.today().isoformat()})
-            await self.bot.enviar_picks_automatico(picks_hoy, mensaje_extra=prefijo)
-        except Exception as e:
-            logger.error(f"❌ Error enviando picks: {e}")
-    
-    async def _enviar_resumen_dia(self, target_date: date):
-        """Envía resumen del día con resultados"""
-        if not config.TELEGRAM_CHAT_ID:
-            return
-        
-        try:
-            client = db.get_client()
-            response = client.table("filtros_aplicados") \
-                .select("*") \
-                .eq("fecha", target_date.isoformat()) \
-                .not_.is_("resultado_pick", "null") \
-                .execute()
-            
-            data = response.data
-            ganados = sum(1 for p in data if p.get("resultado_pick") is True)
-            perdidos = sum(1 for p in data if p.get("resultado_pick") is False)
-            total = ganados + perdidos
-            efectividad = (ganados / total * 100) if total > 0 else 0
-            
-            mensaje = f"""
-📊 *RESUMEN DEL DÍA - {target_date.strftime('%d/%m/%Y')}*
+                logger.warning(f"⚠️ {filtro_id}: {e}")
 
-✅ Ganados: {ganados}
-❌ Perdidos: {perdidos}
-📈 Efectividad: *{efectividad:.1f}%*
+    # ========================= FIX #2: TRIGGERS CON VALIDACIÓN =========================
 
-Total picks evaluados: {total}
-"""
-            await self.bot.app.bot.send_message(
-                chat_id=config.TELEGRAM_CHAT_ID,
-                text=mensaje,
-                parse_mode="Markdown"
+    def _programar_triggers_dinamicos(
+        self, primer_juego: Optional[datetime], ultimo_juego: Optional[datetime]
+    ):
+        """
+        Programa triggers según horarios reales del día.
+        FIX #2: Validar que primer_juego y ultimo_juego no sean None.
+        """
+        # FIX #2: Validación crítica
+        if primer_juego is None or ultimo_juego is None:
+            logger.warning(
+                "⚠️ No se programan triggers: primer_juego o ultimo_juego es None "
+                "(no hay juegos hoy o falta info de horario)"
             )
+            return
+
+        try:
+            primer = primer_juego.astimezone(self.tz)
+            ultimo = ultimo_juego.astimezone(self.tz)
         except Exception as e:
-            logger.error(f"❌ Error enviando resumen: {e}")
-    
-    def _programar_triggers_dinamicos(self, primer_juego: datetime, ultimo_juego: datetime):
-        """
-        Programa los triggers basados en los horarios REALES de los juegos.
-        Esto es lo que resuelve el problema de horarios fijos.
-        """
-        # Convertir a timezone local
-        primer = primer_juego.astimezone(self.tz)
-        ultimo = ultimo_juego.astimezone(self.tz)
-        
-        # Trigger 1: Generar listín (4 horas antes del primer juego)
+            logger.error(f"Error convirtiendo horarios a TZ: {e}")
+            return
+
         hora_listin = primer - timedelta(hours=config.HOURS_BEFORE_FIRST_GAME)
-        
-        # Trigger 2: Actualizar picks (1 hora antes del primer juego)
         hora_actualizar = primer - timedelta(hours=config.HOURS_BEFORE_UPDATE)
-        
-        # Trigger 3: Procesar resultados (2 horas después del último juego)
         hora_resultados = ultimo + timedelta(hours=config.HOURS_AFTER_LAST_GAME)
-        
-        # Eliminar triggers anteriores del día
+
+        # Limpiar jobs anteriores
         for job in self.scheduler.get_jobs():
             if job.id in ["generar_listin_hoy", "actualizar_picks_hoy", "resultados_hoy"]:
                 self.scheduler.remove_job(job.id)
-        
-        # Programar nuevos triggers
-        if hora_listin > datetime.now(self.tz):
+
+        # FIX #1: usar get_now_et()
+        ahora = get_now_et()
+
+        if hora_listin > ahora:
             self.scheduler.add_job(
                 self.task_generar_listin,
                 trigger=DateTrigger(run_date=hora_listin),
                 id="generar_listin_hoy",
                 replace_existing=True,
             )
-            logger.info(f"📅 Listín se generará a las {hora_listin.strftime('%H:%M')}")
+            logger.info(f"📅 Listín auto: {hora_listin.strftime('%H:%M')} ET")
         else:
-            # Si ya pasó la hora, generar ahora
             asyncio.create_task(self.task_generar_listin())
-        
-        if hora_actualizar > datetime.now(self.tz):
+
+        if hora_actualizar > ahora:
             self.scheduler.add_job(
                 self.task_actualizar_picks,
                 trigger=DateTrigger(run_date=hora_actualizar),
                 id="actualizar_picks_hoy",
                 replace_existing=True,
             )
-            logger.info(f"🔄 Picks se actualizarán a las {hora_actualizar.strftime('%H:%M')}")
-        
-        if hora_resultados > datetime.now(self.tz):
+
+        if hora_resultados > ahora:
             self.scheduler.add_job(
                 self.task_resultados,
                 trigger=DateTrigger(run_date=hora_resultados),
                 id="resultados_hoy",
                 replace_existing=True,
             )
-            logger.info(f"📊 Resultados se procesarán a las {hora_resultados.strftime('%H:%M')}")
-    
+
     def iniciar_scheduler(self):
-        """Inicia el scheduler con la tarea matutina diaria"""
-        # Tarea matutina diaria a las 7:00 AM ET
+        """Tarea matutina diaria 7 AM ET"""
         self.scheduler.add_job(
             self.task_morning,
             trigger=CronTrigger(hour=7, minute=0, timezone=self.tz),
             id="morning_task",
             replace_existing=True,
         )
-        
         self.scheduler.start()
-        logger.info("⏰ Scheduler iniciado")
-        logger.info("   📅 Tarea matutina: 7:00 AM ET diariamente")
-    
-    async def ejecutar_manual(self, fecha: date = None):
-        """Ejecuta TODO el flujo manualmente para una fecha (útil para testing)"""
-        if fecha is None:
-            fecha = date.today()
-        
-        logger.info(f"🚀 Ejecución manual completa para {fecha}")
-        
-        # 1. Calendario
-        games = self.calendar.get_games_for_date(fecha)
-        self.calendar.save_to_db(games)
-        
-        # 2. Stats
-        self.stats.collect_for_all_teams(fecha)
-        
-        # 3. Odds
-        self.odds.update_db(self.odds.parse_odds(self.odds.fetch_odds()))
-        
-        # 4. Clima
-        juegos = db.select("juegos", filters={"fecha": fecha.isoformat()})
-        self.weather.update_games_with_weather(juegos)
-        
-        # 5. Filtros
-        self.engine.analizar_dia(fecha)
-        
-        # 6. Listín JSON
-        listin = self.builder.build(fecha)
-        self.builder.save(listin, fecha)
-        
-        # 7. Análisis Gemini
-        analisis = self.agent.analizar_listin(listin)
-        self.agent.guardar_picks(analisis, fecha)
-        
-        # 8. Enviar a Telegram
-        await self._enviar_picks_a_telegram(analisis)
-        
-        logger.info(f"✅ Ejecución manual completada para {fecha}")
-        return analisis
+        logger.info("⏰ Scheduler iniciado (7 AM ET diario)")
+
+    # ========================= UTILIDADES =========================
+
+    def _registrar_log(self, fecha: date, tipo: str, estado: str, mensaje: str):
+        """Helper centralizado para insertar en log_ejecuciones"""
+        try:
+            db.insert("log_ejecuciones", {
+                "fecha": fecha.isoformat(),
+                "tipo": tipo,
+                "estado": estado,
+                "mensaje": mensaje[:500],  # truncar para no romper
+            })
+        except Exception as e:
+            logger.debug(f"No se pudo registrar log: {e}")
 
 
 async def main():
-    """Función principal: inicia el sistema en modo daemon"""
-    logger.info("🎯 === PICKSPROMLB INICIANDO ===")
-    
-    # Validar configuración
+    """Función principal"""
+    logger.info("🎯 === PICKSPROMLB v2.1 INICIANDO ===")
+
     if not config.validar():
-        logger.error("❌ Configuración inválida, no se puede iniciar")
+        logger.error("❌ Configuración inválida")
         return
-    
+
     orchestrator = PicksProOrchestrator()
-    
-    # Iniciar scheduler
     orchestrator.iniciar_scheduler()
-    
-    # Ejecutar tarea matutina inmediatamente al arrancar (para detectar juegos de hoy)
     await orchestrator.task_morning()
-    
-    # Iniciar bot de Telegram en paralelo
-    logger.info("🤖 Iniciando bot de Telegram...")
-    
-    # FIX: Esperar 5 segundos antes de arrancar el bot para evitar conflict con instancia anterior
-    await asyncio.sleep(5)
-    
-    # Mantener el sistema corriendo
+
+    logger.info("🤖 Iniciando bot Telegram...")
+    await asyncio.sleep(5)  # Evitar conflict
+
     try:
-        # Bot polling
         await orchestrator.bot.app.initialize()
         await orchestrator.bot.app.start()
         await orchestrator.bot.app.updater.start_polling(drop_pending_updates=True)
-        
-        logger.info("✅ Sistema corriendo. Presiona Ctrl+C para detener.")
-        
-        # Mantener vivo
+
+        logger.info("✅ Sistema corriendo. Use /cargar_historico (1ra vez) o /analizar.")
         while True:
             await asyncio.sleep(60)
     except KeyboardInterrupt:
-        logger.info("⏹️ Sistema detenido por usuario")
+        logger.info("⏹️ Detenido")
     finally:
         await orchestrator.bot.app.updater.stop()
         await orchestrator.bot.app.stop()
