@@ -5,6 +5,7 @@ Conexión centralizada a la base de datos
 
 from supabase import create_client, Client
 from loguru import logger
+
 from app.utils.config import config
 
 
@@ -47,10 +48,11 @@ class SupabaseClient:
         """Inserta o actualiza registros"""
         client = self.get_client()
         try:
-            query = client.table(table).upsert(data)
+            # FIX: No encadenar dos upsert. Pasar on_conflict como argumento directo del primer upsert.
             if on_conflict:
-                query = query.upsert(data, on_conflict=on_conflict)
-            response = query.execute()
+                response = client.table(table).upsert(data, on_conflict=on_conflict).execute()
+            else:
+                response = client.table(table).upsert(data).execute()
             return response.data
         except Exception as e:
             logger.error(f"❌ Error en upsert {table}: {e}")
