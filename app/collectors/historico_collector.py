@@ -78,20 +78,32 @@ class HistoricoCollector:
         sf = int(batting.get("sacFlies", 0))
         pa = int(batting.get("plateAppearances", 0)) or (ab + bb + hbp + sf)
 
+        # ===== STATS DE BATEO =====
+        h = int(batting.get("hits", 0))
+        doubles = int(batting.get("doubles", 0))
+        triples = int(batting.get("triples", 0))
+        hr = int(batting.get("homeRuns", 0))
+
+        # ⚾ FIX: La API MLB NO devuelve totalBases a nivel equipo.
+        # Hay que CALCULARLO. Si lo intentamos leer da 0 → SLG sale roto.
+        # Fórmula oficial: TB = 1B + 2*2B + 3*3B + 4*HR
+        singles = h - doubles - triples - hr
+        tb_calculado = singles + (2 * doubles) + (3 * triples) + (4 * hr)
+
         bateo = {
             "pa": pa,
             "ab": ab,
-            "h": int(batting.get("hits", 0)),
-            "doubles": int(batting.get("doubles", 0)),
-            "triples": int(batting.get("triples", 0)),
-            "hr": int(batting.get("homeRuns", 0)),
+            "h": h,
+            "doubles": doubles,
+            "triples": triples,
+            "hr": hr,
             "rbi": int(batting.get("rbi", 0)),
             "bb": bb,
             "so": int(batting.get("strikeOuts", 0)),
             "hbp": hbp,
             "sb": int(batting.get("stolenBases", 0)),
             "sf": sf,
-            "tb": int(batting.get("totalBases", 0)),
+            "tb": tb_calculado,  # ⚾ Calculado, no leído
             "lob": int(batting.get("leftOnBase", 0)),
             "r": int(batting.get("runs", 0)),
         }
