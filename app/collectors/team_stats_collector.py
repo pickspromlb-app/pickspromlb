@@ -61,10 +61,15 @@ class TeamStatsCollector:
             "so": sum(g.get("so", 0) for g in games),
             "hbp": sum(g.get("hbp", 0) for g in games),
             "sf": sum(g.get("sf", 0) for g in games),
-            "tb": sum(g.get("tb", 0) for g in games),
             "pa": sum(g.get("pa", 0) for g in games),
         }
+        # Singles = H - 2B - 3B - HR
         agg["singles"] = agg["h"] - agg["doubles"] - agg["triples"] - agg["hr"]
+        # ⚾ FIX BUG SLG: TB DEBE calcularse desde hits, no leerse de la caché.
+        # La API MLB no devuelve totalBases a nivel equipo, por eso TB salía en 0
+        # y SLG se calculaba como 0, y OPS = OBP, y los filtros F2/F4/F7/F8 nunca activaban.
+        # Fórmula oficial MLB: TB = 1B + 2*2B + 3*3B + 4*HR
+        agg["tb"] = agg["singles"] + (2 * agg["doubles"]) + (3 * agg["triples"]) + (4 * agg["hr"])
         return agg
 
     def _aggregate_bullpen(self, games: List[Dict]) -> Dict:
