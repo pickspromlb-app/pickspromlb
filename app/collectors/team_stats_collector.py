@@ -1,211 +1,389 @@
 """
-PicksProMLB - Recolector de Estadísticas de Equipos
-Calcula stats por ventanas (L1, L3, L5, L7, L10) usando MLB Stats API y pybaseball
+PicksProMLB - Calculador de Estadísticas Sabermétricas (v2 con caché)
+================================================================
+ESTE ARCHIVO YA NO LLAMA A LA API DE MLB.
+Lee los juegos pre-cargados de historico_juegos_equipos y CALCULA
+las ventanas L1, L3, L5, L7, L10 con stats sabermétricas reales.
+
+Es ULTRA RÁPIDO (segundos en vez de minutos).
 """
 
-import statsapi
-import pandas as pd
-from datetime import datetime, date, timedelta
+from datetime import date
 from typing import Dict, List, Optional
 from loguru import logger
+
 from app.utils.database import db
 from app.utils.config import config
+from app.utils.time_utils import get_today_et
+from app.collectors.historico_collector import HistoricoCollector
 
 
-# IDs de MLB para cada equipo (necesarios para statsapi)
-MLB_TEAM_IDS = {
-    "ARI": 109, "ATL": 144, "BAL": 110, "BOS": 111, "CHC": 112,
-    "CHW": 145, "CIN": 113, "CLE": 114, "COL": 115, "DET": 116,
-    "HOU": 117, "KCR": 118, "LAA": 108, "LAD": 119, "MIA": 146,
-    "MIL": 158, "MIN": 142, "NYM": 121, "NYY": 147, "ATH": 133,
-    "PHI": 143, "PIT": 134, "SDP": 135, "SEA": 136, "SFG": 137,
-    "STL": 138, "TBR": 139, "TEX": 140, "TOR": 141, "WSN": 120,
+# Constantes wOBA 2024 (oficiales FanGraphs)
+WOBA_WEIGHTS = {
+    "BB": 0.696,
+    "HBP": 0.726,
+    "1B": 0.886,
+    "2B": 1.261,
+    "3B": 1.601,
+    "HR": 2.072,
 }
+
+# wOBA y wRC+ de la liga (2024-2025)
+LEAGUE_WOBA = 0.318
+LEAGUE_WRC = 4.28
+WOBA_SCALE = 1.157
 
 
 class TeamStatsCollector:
-    """Recolecta estadísticas de equipos por ventanas de juegos"""
-    
+    """Calcula stats sabermétricas POR VENTANA leyendo de la BD"""
+
     def __init__(self):
-        self.windows = [1, 3, 5, 7, 10]  # Ventanas de últimos N juegos
-    
-    def get_team_recent_games(self, team_abbr: str, num_games: int = 10) -> List[Dict]:
-        """
-        Obtiene los últimos N juegos completados de un equipo.
-        Usa MLB Stats API.
-        """
-        team_id = MLB_TEAM_IDS.get(team_abbr)
-        if not team_id:
-            logger.warning(f"⚠️ ID no encontrado para {team_abbr}")
-            return []
-        
-        # Buscar juegos en los últimos 30 días
-        end_date = date.today()
-        start_date = end_date - timedelta(days=30)
-        
-        try:
-            schedule = statsapi.schedule(
-                start_date=start_date.strftime("%Y-%m-%d"),
-                end_date=end_date.strftime("%Y-%m-%d"),
-                team=team_id
-            )
-        except Exception as e:
-            logger.error(f"❌ Error obteniendo juegos de {team_abbr}: {e}")
-            return []
-        
-        # Filtrar solo finalizados
-        completed = [g for g in schedule if g.get("status") in ["Final", "Game Over"]]
-        
-        # Ordenar por fecha descendente y tomar los últimos N
-        completed.sort(key=lambda x: x.get("game_date", ""), reverse=True)
-        return completed[:num_games]
-    
-    def calculate_window_stats(self, team_abbr: str, games: List[Dict]) -> Dict:
-        """
-        Calcula estadísticas básicas de una ventana de juegos.
-        Para stats avanzadas (wOBA, wRC+) usaremos pybaseball en otro método.
-        """
+        self.windows = [1, 3, 5, 7, 10]
+        self.historico = HistoricoCollector()
+
+    # ========================= AGREGACIÓN =========================
+
+    def _aggregate_games(self, games: List[Dict]) -> Dict:
+        """Agrega stats acumuladas de N juegos"""
         if not games:
             return {}
-        
-        team_id = MLB_TEAM_IDS.get(team_abbr)
-        
-        # Acumular stats
-        total_runs = 0
-        total_runs_against = 0
-        wins = 0
-        
-        for game in games:
-            if game.get("home_id") == team_id:
-                total_runs += game.get("home_score", 0)
-                total_runs_against += game.get("away_score", 0)
-                if game.get("home_score", 0) > game.get("away_score", 0):
-                    wins += 1
-            else:
-                total_runs += game.get("away_score", 0)
-                total_runs_against += game.get("home_score", 0)
-                if game.get("away_score", 0) > game.get("home_score", 0):
-                    wins += 1
-        
-        return {
-            "juegos": len(games),
-            "carreras_hechas": total_runs,
-            "carreras_recibidas": total_runs_against,
-            "victorias": wins,
-            "promedio_carreras": round(total_runs / len(games), 2) if games else 0,
+
+        agg = {
+            "g": len(games),
+            "ab": sum(g.get("ab", 0) for g in games),
+            "r": sum(g.get("r", 0) for g in games),
+            "h": sum(g.get("h", 0) for g in games),
+            "doubles": sum(g.get("doubles", 0) for g in games),
+            "triples": sum(g.get("triples", 0) for g in games),
+            "hr": sum(g.get("hr", 0) for g in games),
+            "rbi": sum(g.get("rbi", 0) for g in games),
+            "bb": sum(g.get("bb", 0) for g in games),
+            "so": sum(g.get("so", 0) for g in games),
+            "hbp": sum(g.get("hbp", 0) for g in games),
+            "sf": sum(g.get("sf", 0) for g in games),
+            "tb": sum(g.get("tb", 0) for g in games),
+            "pa": sum(g.get("pa", 0) for g in games),
         }
-    
-    def collect_advanced_stats(self, team_abbr: str, target_date: date = None) -> Dict:
-        """
-        Recolecta stats avanzadas usando pybaseball (FanGraphs).
-        
-        IMPORTANTE: Esta es una implementación base. Para producción,
-        usaremos pybaseball.team_batting_bref() o consultaremos FanGraphs
-        directamente con las ventanas de tiempo.
-        """
-        if target_date is None:
-            target_date = date.today()
-        
-        try:
-            from pybaseball import team_batting_bref
-            
-            # Obtener stats de la temporada
-            year = target_date.year
-            
-            # NOTA: pybaseball no tiene endpoint directo para "últimos N juegos"
-            # Necesitaremos calcularlo manualmente o usar otro método
-            
-            # Por ahora retornamos placeholder
-            stats = {
-                "team": team_abbr,
-                "fecha": target_date.isoformat(),
-                "fuente": "pybaseball",
-                "nota": "Implementación pendiente con pybaseball + cálculo manual"
-            }
-            
-            return stats
-            
-        except ImportError:
-            logger.warning("⚠️ pybaseball no disponible, usando solo MLB Stats API")
+        agg["singles"] = agg["h"] - agg["doubles"] - agg["triples"] - agg["hr"]
+        return agg
+
+    def _aggregate_bullpen(self, games: List[Dict]) -> Dict:
+        """Agrega stats del bullpen de N juegos"""
+        if not games:
             return {}
-        except Exception as e:
-            logger.error(f"❌ Error obteniendo stats avanzadas: {e}")
+        return {
+            "bp_ip_outs": sum(g.get("bp_ip_outs", 0) for g in games),
+            "bp_h": sum(g.get("bp_h", 0) for g in games),
+            "bp_r": sum(g.get("bp_r", 0) for g in games),
+            "bp_er": sum(g.get("bp_er", 0) for g in games),
+            "bp_bb": sum(g.get("bp_bb", 0) for g in games),
+            "bp_so": sum(g.get("bp_so", 0) for g in games),
+            "bp_hr": sum(g.get("bp_hr", 0) for g in games),
+            "bp_hbp": sum(g.get("bp_hbp", 0) for g in games),
+            "bp_tbf": sum(g.get("bp_tbf", 0) for g in games),
+        }
+
+    # ========================= STATS BÁSICAS =========================
+
+    def _calc_basic_stats(self, agg: Dict) -> Dict:
+        """Calcula AVG, OBP, SLG, OPS, ISO, BABIP, BB%, K%, BB/K"""
+        ab = agg.get("ab", 0)
+        h = agg.get("h", 0)
+        bb = agg.get("bb", 0)
+        hbp = agg.get("hbp", 0)
+        sf = agg.get("sf", 0)
+        tb = agg.get("tb", 0)
+        so = agg.get("so", 0)
+        hr = agg.get("hr", 0)
+        pa = agg.get("pa", 0) or (ab + bb + hbp + sf)
+
+        avg = h / ab if ab > 0 else 0.0
+        obp = (h + bb + hbp) / pa if pa > 0 else 0.0
+        slg = tb / ab if ab > 0 else 0.0
+        ops = obp + slg
+        iso = slg - avg
+        babip_denom = ab - so - hr + sf
+        babip = (h - hr) / babip_denom if babip_denom > 0 else 0.0
+        bb_pct = bb / pa if pa > 0 else 0.0
+        k_pct = so / pa if pa > 0 else 0.0
+        bbk = bb / so if so > 0 else 0.0
+
+        return {
+            "avg": round(avg, 4),
+            "obp": round(obp, 4),
+            "slg": round(slg, 4),
+            "ops": round(ops, 4),
+            "iso": round(iso, 4),
+            "babip": round(babip, 4),
+            "bb_pct": round(bb_pct, 4),
+            "k_pct": round(k_pct, 4),
+            "bbk": round(bbk, 2),
+        }
+
+    def _calc_advanced_stats(self, agg: Dict) -> Dict:
+        """Calcula wOBA, wRAA, wRC, wRC+"""
+        bb = agg.get("bb", 0)
+        hbp = agg.get("hbp", 0)
+        singles = agg.get("singles", 0)
+        doubles = agg.get("doubles", 0)
+        triples = agg.get("triples", 0)
+        hr = agg.get("hr", 0)
+        ab = agg.get("ab", 0)
+        sf = agg.get("sf", 0)
+        pa = agg.get("pa", 0) or (ab + bb + hbp + sf)
+
+        # wOBA
+        woba_denom = ab + bb + sf + hbp
+        if woba_denom > 0:
+            woba_num = (
+                WOBA_WEIGHTS["BB"] * bb
+                + WOBA_WEIGHTS["HBP"] * hbp
+                + WOBA_WEIGHTS["1B"] * singles
+                + WOBA_WEIGHTS["2B"] * doubles
+                + WOBA_WEIGHTS["3B"] * triples
+                + WOBA_WEIGHTS["HR"] * hr
+            )
+            woba = woba_num / woba_denom
+        else:
+            woba = 0.0
+
+        # wRAA = ((wOBA - lgWOBA) / wOBAScale) * PA
+        wraa = ((woba - LEAGUE_WOBA) / WOBA_SCALE) * pa if pa > 0 else 0.0
+
+        # wRC+ aproximado
+        league_r_per_pa = LEAGUE_WRC / 38.0
+        if league_r_per_pa > 0:
+            wrc_per_pa = (woba - LEAGUE_WOBA) / WOBA_SCALE + league_r_per_pa
+            wrc_plus = round((wrc_per_pa / league_r_per_pa) * 100)
+            wrc = round(wrc_per_pa * pa) if pa > 0 else 0
+        else:
+            wrc_plus = 100
+            wrc = 0
+
+        return {
+            "woba": round(woba, 4),
+            "wraa": round(wraa, 2),
+            "wrc": wrc,
+            "wrc_plus": wrc_plus,
+        }
+
+    def _calc_bullpen_stats(self, agg: Dict) -> Dict:
+        """Calcula ERA, WHIP, FIP, etc del bullpen"""
+        ip = agg.get("bp_ip_outs", 0) / 3.0
+        if ip == 0:
             return {}
-    
+
+        h = agg.get("bp_h", 0)
+        r = agg.get("bp_r", 0)
+        er = agg.get("bp_er", 0)
+        bb = agg.get("bp_bb", 0)
+        so = agg.get("bp_so", 0)
+        hr = agg.get("bp_hr", 0)
+        hbp = agg.get("bp_hbp", 0)
+        tbf = agg.get("bp_tbf", 0)
+        ab_approx = tbf - bb - hbp
+
+        era = (er * 9) / ip if ip > 0 else 0
+        whip = (bb + h) / ip if ip > 0 else 0
+        avg_perm = h / ab_approx if ab_approx > 0 else 0
+        k_9 = (so * 9) / ip if ip > 0 else 0
+        bb_9 = (bb * 9) / ip if ip > 0 else 0
+        hr_9 = (hr * 9) / ip if ip > 0 else 0
+        k_bb = so / bb if bb > 0 else so
+        k_pct = so / tbf if tbf > 0 else 0
+        bb_pct = bb / tbf if tbf > 0 else 0
+        # FIP simplificado
+        fip = (
+            ((13 * hr + 3 * (bb + hbp) - 2 * so) / ip + 3.10) if ip > 0 else 0
+        )
+
+        return {
+            "ip": round(ip, 1),
+            "era": round(era, 2),
+            "whip": round(whip, 2),
+            "avg_permitido": round(avg_perm, 3),
+            "k_9": round(k_9, 1),
+            "bb_9": round(bb_9, 1),
+            "hr_9": round(hr_9, 1),
+            "k_bb": round(k_bb, 2),
+            "k_pct": round(k_pct, 4),
+            "bb_pct": round(bb_pct, 4),
+            "fip": round(fip, 2),
+            "tbf": tbf,
+        }
+
+    # ========================= RECOLECCIÓN PRINCIPAL =========================
+
+    def _jugo_en_coors(self, games: List[Dict]) -> bool:
+        """Detecta si los últimos 3 juegos fueron en Coors Field"""
+        if not games:
+            return False
+        for g in games[:3]:
+            estadio = g.get("estadio", "")
+            if "Coors" in estadio:
+                return True
+        return False
+
     def collect_for_team(self, team_abbr: str, target_date: date = None) -> Dict:
         """
-        Recolecta TODAS las stats de un equipo (todas las ventanas + avanzadas).
+        Calcula stats por ventana LEYENDO DE LA BD (no llama API).
+        Es ULTRA RÁPIDO.
         """
         if target_date is None:
-            target_date = date.today()
-        
-        logger.info(f"📊 Recolectando stats de {team_abbr}")
-        
-        # Obtener últimos 10 juegos
-        recent_games = self.get_team_recent_games(team_abbr, num_games=10)
-        
-        if not recent_games:
-            logger.warning(f"⚠️ No hay juegos recientes para {team_abbr}")
+            target_date = get_today_et()
+
+        # Leer últimos 10 juegos del equipo desde la BD
+        games = self.historico.get_juegos_equipo(team_abbr, num_games=10)
+
+        if not games:
+            logger.warning(
+                f"⚠️ {team_abbr}: sin datos en caché. Ejecuta /cargar_historico primero."
+            )
             return {}
-        
-        # Calcular stats por cada ventana
+
         result = {
             "fecha": target_date.isoformat(),
             "equipo": team_abbr,
+            "jugo_en_coors": self._jugo_en_coors(games),
         }
-        
+
+        # Calcular para cada ventana
         for window in self.windows:
-            window_games = recent_games[:window]
-            stats = self.calculate_window_stats(team_abbr, window_games)
-            
-            # Mapear a campos de DB
-            result[f"juegos_l{window}"] = stats.get("juegos", 0)
-            result[f"carreras_l{window}"] = stats.get("carreras_hechas", 0)
-        
-        # Stats avanzadas (placeholder por ahora)
-        advanced = self.collect_advanced_stats(team_abbr, target_date)
-        result.update(advanced)
-        
+            window_games = games[:window]
+            if not window_games:
+                continue
+
+            # Bateo
+            agg = self._aggregate_games(window_games)
+            basic = self._calc_basic_stats(agg)
+            advanced = self._calc_advanced_stats(agg)
+
+            result[f"avg_l{window}"] = basic["avg"]
+            result[f"obp_l{window}"] = basic["obp"]
+            result[f"slg_l{window}"] = basic["slg"]
+            result[f"ops_l{window}"] = basic["ops"]
+            result[f"iso_l{window}"] = basic["iso"]
+            result[f"babip_l{window}"] = basic["babip"]
+            result[f"bb_pct_l{window}"] = basic["bb_pct"]
+            result[f"k_pct_l{window}"] = basic["k_pct"]
+            result[f"bbk_l{window}"] = basic["bbk"]
+            result[f"woba_l{window}"] = advanced["woba"]
+            result[f"wraa_l{window}"] = advanced["wraa"]
+            result[f"wrc_l{window}"] = advanced["wrc"]
+            result[f"wrc_plus_l{window}"] = advanced["wrc_plus"]
+            result[f"juegos_l{window}"] = agg["g"]
+            result[f"carreras_l{window}"] = agg["r"]
+
+        # Stats de "temporada" (todos los juegos en caché)
+        all_agg = self._aggregate_games(games)
+        all_basic = self._calc_basic_stats(all_agg)
+        all_advanced = self._calc_advanced_stats(all_agg)
+        result["avg_temp"] = all_basic["avg"]
+        result["obp_temp"] = all_basic["obp"]
+        result["slg_temp"] = all_basic["slg"]
+        result["ops_temp"] = all_basic["ops"]
+        result["iso_temp"] = all_basic["iso"]
+        result["babip_temp"] = all_basic["babip"]
+        result["bb_pct_temp"] = all_basic["bb_pct"]
+        result["k_pct_temp"] = all_basic["k_pct"]
+        result["bbk_temp"] = all_basic["bbk"]
+        result["woba_temp"] = all_advanced["woba"]
+        result["wraa_temp"] = all_advanced["wraa"]
+        result["wrc_plus_temp"] = all_advanced["wrc_plus"]
+
+        # Bullpen últimos 5 juegos
+        bp_agg = self._aggregate_bullpen(games[:5])
+        bp_stats = self._calc_bullpen_stats(bp_agg)
+        if bp_stats:
+            result["bullpen_l5"] = bp_stats
+
+        logger.info(
+            f"✅ {team_abbr}: AVG={all_basic['avg']:.3f} OPS={all_basic['ops']:.3f} "
+            f"wOBA={all_advanced['woba']:.3f} wRC+={all_advanced['wrc_plus']}"
+        )
         return result
-    
+
     def collect_for_all_teams(self, target_date: date = None) -> List[Dict]:
-        """Recolecta stats de TODOS los equipos MLB"""
+        """Calcula stats de los 30 equipos LEYENDO de BD (rápido)"""
         if target_date is None:
-            target_date = date.today()
-        
+            target_date = get_today_et()
+
+        logger.info("📊 === CALCULANDO STATS DE LOS 30 EQUIPOS (desde caché) ===")
+
         all_stats = []
+        all_bullpens = []
+
         for team_abbr in config.EQUIPOS_MLB.keys():
             try:
                 stats = self.collect_for_team(team_abbr, target_date)
                 if stats:
+                    # Separar bullpen
+                    bp_stats = stats.pop("bullpen_l5", None)
                     all_stats.append(stats)
+
+                    if bp_stats:
+                        bp_record = {
+                            "fecha": target_date.isoformat(),
+                            "equipo": team_abbr,
+                            "ip_l5": bp_stats["ip"],
+                            "tbf_l5": bp_stats["tbf"],
+                            "era_l5": bp_stats["era"],
+                            "whip_l5": bp_stats["whip"],
+                            "avg_permitido_l5": bp_stats["avg_permitido"],
+                            "k_9_l5": bp_stats["k_9"],
+                            "bb_9_l5": bp_stats["bb_9"],
+                            "hr_9_l5": bp_stats["hr_9"],
+                            "k_bb_l5": bp_stats["k_bb"],
+                            "k_pct_l5": bp_stats["k_pct"],
+                            "bb_pct_l5": bp_stats["bb_pct"],
+                            "fip_l5": bp_stats["fip"],
+                        }
+                        all_bullpens.append(bp_record)
             except Exception as e:
                 logger.error(f"❌ Error con {team_abbr}: {e}")
                 continue
-        
-        logger.info(f"✅ Stats recolectadas para {len(all_stats)} equipos")
+
+        # Guardar en BD
+        if all_stats:
+            self.save_to_db(all_stats)
+        if all_bullpens:
+            self.save_bullpens_to_db(all_bullpens)
+
+        logger.info(
+            f"✅ Stats: {len(all_stats)}/30 | Bullpens: {len(all_bullpens)}/30"
+        )
         return all_stats
-    
+
     def save_to_db(self, team_stats: List[Dict]) -> int:
-        """Guarda las stats en la tabla equipos_diario"""
+        """Guarda en equipos_diario"""
         saved = 0
         for stats in team_stats:
             try:
                 db.upsert("equipos_diario", stats, on_conflict="fecha,equipo")
                 saved += 1
             except Exception as e:
-                logger.error(f"❌ Error guardando stats de {stats.get('equipo')}: {e}")
-        
+                logger.error(
+                    f"❌ Error guardando stats {stats.get('equipo')}: {e}"
+                )
         logger.info(f"💾 {saved}/{len(team_stats)} stats guardadas")
+        return saved
+
+    def save_bullpens_to_db(self, bullpens: List[Dict]) -> int:
+        """Guarda en bullpenes_diario"""
+        saved = 0
+        for bp in bullpens:
+            try:
+                db.upsert("bullpenes_diario", bp, on_conflict="fecha,equipo")
+                saved += 1
+            except Exception as e:
+                logger.error(f"❌ Error guardando bullpen {bp.get('equipo')}: {e}")
+        logger.info(f"💾 {saved}/{len(bullpens)} bullpens guardados")
         return saved
 
 
 def run():
-    """Ejecuta el recolector de stats de equipos"""
     collector = TeamStatsCollector()
-    stats = collector.collect_for_all_teams()
-    collector.save_to_db(stats)
-    return stats
+    return collector.collect_for_all_teams()
 
 
 if __name__ == "__main__":
